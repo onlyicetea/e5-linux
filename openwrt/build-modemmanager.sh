@@ -49,6 +49,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TOP="$(cd "$HERE/.." && pwd)"
 WORK="$TOP/work/openwrt"
 OUT="$TOP/out/openwrt"
+# On a host build the commands below reach their inputs and outputs through the
+# container's mount points, so those are the paths to use (override with
+# E5_BUILD_WORK / E5_BUILD_OUT for a tree elsewhere).
+if [ "${E5_DOCKER:-docker}" = none ]; then
+    WORK=${E5_BUILD_WORK:-/work}
+    OUT=${E5_BUILD_OUT:-/out}
+fi
 URL=https://downloads.openwrt.org/releases/$VER/targets/armsr/armv8
 mkdir -p "$WORK" "$OUT"
 
@@ -66,10 +73,32 @@ done
 cp "$HERE"/patches/modemmanager-package-*.patch "$WORK/patches/pkg/"
 
 # the container is the host's architecture (the buildroot cross-compiles for the target either way);
-# E5_DOCKER=podman on a host without docker (SELinux wants the bind mounts relabelled, :z)
+# E5_DOCKER=podman on a host without docker (SELinux wants the bind mounts relabelled, :z);
+# E5_DOCKER=none runs them on the host itself -- a Linux host that is already the
+# build environment (WSL, a VM, a plain machine).  Nothing is repacked for it: the
+# commands are taken out of this script below, so the container and the host cannot
+# drift apart.  They expect the container's three mount points as directories, and
+# /build (the OpenWrt tree) has to be on a case-sensitive filesystem -- on WSL that
+# means the ext4 root, never /mnt/... (9p).  apt wants root there, so run it as root:
+#   sudo mkdir -p /build /work /out   # or let the tree live in the scratch dirs
+#   sudo env E5_DOCKER=none bash openwrt/build-modemmanager.sh
 DOCKER=${E5_DOCKER:-docker}
 case "$(uname -m)" in x86_64) PLAT=linux/amd64;; *) PLAT=linux/arm64;; esac
 Z=; [ "$DOCKER" = podman ] && Z=,z
+
+if [ "$DOCKER" = none ]; then
+    JOBS=${E5_JOBS:-$(nproc)}
+    sed -n "/^    debian:trixie bash -euc '/,/^'$/p" "$0" | sed '1d;$d' > "$WORK/build-inside.sh"
+    # (an extraction that found nothing would run an empty script and "succeed")
+    [ "$(wc -l < "$WORK/build-inside.sh")" -gt 40 ] || { echo "no build commands extracted from $0" >&2; exit 1; }
+    grep -q "^make package/modemmanager/compile" "$WORK/build-inside.sh" || { echo "the extracted commands are not the build" >&2; exit 1; }
+    echo "== native host build (E5_DOCKER=none): /build /work /out, $JOBS jobs"
+    mkdir -p /build
+    export VER E5REV JOBS
+    bash -e "$WORK/build-inside.sh"
+    exit $?
+fi
+
 $DOCKER run --rm --platform $PLAT -v e5-openwrt-src:/build \
     -v "$WORK":/work:ro$Z -v "$OUT":/out${Z:+:z} -e VER="$VER" -e E5REV="$E5REV" \
     -e JOBS="${E5_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc)}" \
