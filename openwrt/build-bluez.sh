@@ -19,6 +19,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TOP="$(cd "$HERE/.." && pwd)"
 WORK="$TOP/work/openwrt"
 OUT="$TOP/out/openwrt"
+# On a host build the commands below reach their inputs and outputs through the
+# container's mount points, so those are the paths to use (the same convention
+# as openwrt/build-modemmanager.sh; override with E5_BUILD_WORK / E5_BUILD_OUT).
+if [ "${E5_DOCKER:-docker}" = none ]; then
+    WORK=${E5_BUILD_WORK:-/work}
+    OUT=${E5_BUILD_OUT:-/out}
+fi
 URL=https://downloads.openwrt.org/releases/$VER/targets/armsr/armv8
 # 1: 01-sdp-large-mtu
 E5REV=1
@@ -33,6 +40,24 @@ for p in "$TOP"/rootfs/deb-patches/bluez-0*.patch; do
     cp "$p" "$WORK/bluez-patches/$n-e5-$(basename "$p" | sed 's/^bluez-//')"
     n=$((n + 1))
 done
+
+# E5_DOCKER=none runs the commands below on the host itself, the way
+# openwrt/build-modemmanager.sh does: they are taken out of this script, so the
+# container and the host cannot drift apart.  /build (the OpenWrt tree) has to be
+# the one that script made, on a case-sensitive filesystem, and apt wants root:
+#   sudo env E5_DOCKER=none bash openwrt/build-bluez.sh
+if [ "${E5_DOCKER:-docker}" = none ]; then
+    JOBS=${E5_JOBS:-$(nproc)}
+    sed -n "/^    debian:trixie bash -euc '/,/^'\$/p" "$0" | sed '1d;$d' > "$WORK/build-inside-bluez.sh"
+    # (an extraction that found nothing would run an empty script and "succeed")
+    [ "$(wc -l < "$WORK/build-inside-bluez.sh")" -gt 20 ] || { echo "no build commands extracted from $0" >&2; exit 1; }
+    grep -q "^make package/bluez/compile" "$WORK/build-inside-bluez.sh" || { echo "the extracted commands are not the bluez build" >&2; exit 1; }
+    echo "== native host build (E5_DOCKER=none): /build /work /out, $JOBS jobs"
+    mkdir -p /build
+    export E5REV JOBS
+    bash -e "$WORK/build-inside-bluez.sh"
+    exit $?
+fi
 
 docker run --rm --platform linux/arm64 -v e5-openwrt-src:/build \
     -v "$WORK":/work:ro -v "$OUT":/out -e E5REV="$E5REV" \
