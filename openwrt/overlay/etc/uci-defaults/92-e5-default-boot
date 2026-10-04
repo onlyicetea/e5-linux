@@ -5,6 +5,15 @@
 # initramfs gives the next boot back to Android.
 E5_DEFAULT_BOOT=
 [ -f /etc/e5/install.conf ] && . /etc/e5/install.conf
+# A card in the slot is the system the user put there, so it is the default
+# system: it stays the default boot after a reboot.  Without this the phone
+# went back to Android on its own (measured 2026-10-04) -- boot/init restores
+# slot a unless /etc/e5linux/default-boot says linux, and nothing wrote that
+# file for a card install, because the gate below only covers an install that
+# asks for it in /etc/e5/install.conf.  e5-next-boot itself refuses a trial
+# image (e5.openwrt= on the kernel command line), so this cannot make a test
+# boot permanent.
+[ -f /etc/e5/sd-root ] && E5_DEFAULT_BOOT=linux
 [ "$E5_DEFAULT_BOOT" = linux ] || exit 0
 [ -f /etc/e5linux/default-boot ] && exit 0
 /opt/e5/e5-next-boot linux
