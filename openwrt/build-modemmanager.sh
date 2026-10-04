@@ -4,7 +4,7 @@
 #   openwrt/build-modemmanager.sh        -> out/openwrt/modemmanager-*.apk
 #
 # OpenWrt 25.12 ships ModemManager 1.24.0, the version rootfs/deb-patches/
-# modemmanager-0[1-6]-*.patch are written against, so the Debian image and the
+# modemmanager-0[1-7]-*.patch are written against, so the Debian image and the
 # OpenWrt one run the same plugin (docs/FINDINGS.md 37).  The patches go into
 # the feed package's patches/ after OpenWrt's own (0001-0004, which they stack
 # on cleanly), and patches/modemmanager-package-*.patch adjusts the package's
@@ -39,7 +39,11 @@ set -euo pipefail
 # 4: both cards up from +CFUN: 0, and +SPSWDATA before every dial (SIM card switch)
 # 5: the work modes (+SPTESTMODEM) in that power-up, no stop on the other card's errors,
 #    and the SIM slots (both cards listed; a switch through e5-sim)
-E5REV=5
+# 6: the power-up probes +CCID? per slot first and brings up the SIM, work mode and
+#    stack only of the slots holding a card: a stack on an empty slot asserts the CP
+#    (mnphone_api.c:7401), which silences its AT server until the CP is reset, so
+#    ModemManager timed out ten times, dropped the modem, and the phone read no card
+E5REV=6
 VER=${E5_WRT_VER:-25.12.5}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TOP="$(cd "$HERE/.." && pwd)"
