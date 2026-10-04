@@ -5453,26 +5453,38 @@ Two gates stay open: with **no card at all** the phone should now list a modem i
 asserting (the cleanest form of the same test), and the 广电 card has to come back for
 registration, data, and both slots filled -- `e5-sim` must keep working.
 
-### 62.1 What the fix exposed: ModemManager leaves the modem `disabled` after our power-up
+### 62.1 The 搜索网络 under it was my own `ifdown wan`, not a plugin defect
 
-With the assert gone, a second layer appeared, and it predates patch 07 -- under the old
-package the modem was dropped before this layer could be seen.  `mmcli` reports
-`state: disabled` while the CP is at `+CFUN: 1` and attached, so the 3GPP interface is
-never queried: the status API returns `operator: null, registration: null` and the screen
-falls back to 「搜索网络」 even though `quality: 97` says there is signal.  Asking MM
-directly fixes it in about two seconds:
+With the assert gone, one symptom stayed: `mmcli` reported `state: disabled` while the CP
+was at `+CFUN: 1` and attached, the status API returned `operator: null, registration:
+null`, and the screen showed 「搜索网络」 even though `quality: 97` said there was signal.
+Enabling it by hand cleared that in about two seconds:
 
     mmcli -m 0 -e 1     -> "successfully enabled the modem"
     3GPP registration (unknown -> registering -> home), packet service (unknown -> attached)
     state changed (enabled -> registered);  operator CHN-TELECOM, tech 5gnr
 
-Two ready-made explanations were measured and dismissed.  It is not "MM read `+CFUN: 0` at
-init and never looked again": restarting MM while `+CFUN` was already 1 still produced
-`disabled`.  And it is not netifd's job: the OpenWrt `modemmanager` protocol issues
-`--simple-connect`, `--set-allowed-modes`, `--pin` and status polling, and contains **no**
-`--enable` at all.  What is left is our own power-up path -- it raises the SIM and the
-stack and then never reports the modem as enabled, so nothing enables it until some client
-asks.
+The first version of this section blamed the plugin's power-up path and asserted that the
+OpenWrt `modemmanager` protocol "contains no `--enable`".  **That was wrong, and the
+evidence had already been in my own output** -- `/lib/netifd/proto/modemmanager.sh:624`:
+
+    mmcli --modem="${device}" --timeout 120 --enable || {
+            proto_notify_error "${interface}" MM_MODEM_DISABLED
+            return 1
+    }
+
+netifd enables the modem as a step of bringing `wan` up, which is precisely the thing I
+had taken down to protect the SIM's data allowance.  A cold boot with a card in slot 1 and
+slot 2 empty settles it: **no assert at all**, and the modem reached `state: connected`,
+`operator id: 46011`, `registration: home`, packet service attached.  So this layer needs
+no patch: `disabled` is MM reporting honestly that nobody asked it to enable, and every
+status surface renders that as 搜索网络.  The other dismissal in that draft ("restarting
+MM while `+CFUN` was already 1 still produced `disabled`") is consistent with the same
+explanation -- with `wan` down there is no caller at all.
+
+The measurement lesson is the reason this paragraph exists: a keyword grep whose output
+was truncated by a `tail` was read as an absence.  The line I said did not exist was in
+the same tool result, three of the six matches I printed.
 
 ### 62.2 The COM29 the E5 gives the host is a root shell
 
