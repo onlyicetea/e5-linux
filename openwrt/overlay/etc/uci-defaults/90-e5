@@ -29,6 +29,19 @@ if [ ! -f /etc/e5/install.conf ] && [ -f /mnt/e5-data/e5linux/openwrt-install.co
 	(umask 077; cp /mnt/e5-data/e5linux/openwrt-install.conf /etc/e5/install.conf) &&
 		rm -f /mnt/e5-data/e5linux/openwrt-install.conf
 fi
+# netifd's modemmanager proto puts the modem in flight mode whenever it takes
+# wan down (/lib/netifd/proto/modemmanager.sh: mmcli --disable, unless
+# disable_modem=0).  The bearer does come down here on its own: the CP
+# releases the sipa data link now and then, netifd sees the link loss, and one
+# teardown then cost the whole network -- the CP de-registered, and the
+# infoscreen fell back to "searching for network" with no signal while +COPS?
+# still answered CHN-TELECOM.  A bearer loss is not a reason to leave the
+# network.
+# Set before the early exit below, so a reinstall over an existing
+# /etc/config/network repairs it too.
+[ "$(uci -q get network.wan.proto)" = modemmanager ] &&
+	[ -z "$(uci -q get network.wan.disable_modem)" ] &&
+	uci -q set network.wan.disable_modem='0' && uci -q commit network
 E5_APN=
 [ -f /etc/e5/install.conf ] && . /etc/e5/install.conf
 # once: a reinstall keeps the configuration (openwrt/device-install.sh),
@@ -66,6 +79,8 @@ set network.wan.init_epsbearer='default'
 # one uplink: the IPv6 default route for everything, not only for sources in
 # the bearer's /64 (the router's own traffic did not match it)
 set network.wan.sourcefilter='0'
+# take wan down without flight-modeing the modem (see the note above)
+set network.wan.disable_modem='0'
 
 set dhcp.lan.start='10'
 set dhcp.lan.limit='191'
