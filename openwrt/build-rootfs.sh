@@ -4,6 +4,17 @@
 #   openwrt/build-modemmanager.sh      (once, and after a ModemManager patch changes)
 #   openwrt/build-rootfs.sh
 #
+# E5_DOCKER=none builds the same image on the host, with no container runtime:
+#
+#   sudo env E5_DOCKER=none E5_STANDALONE=1 E5_DEVICE_FILES=0 \
+#       E5_ROOT_MODULES=<root-modules.tar> E5_ROOT_MODULES_ONLY=1 \
+#       bash openwrt/build-rootfs.sh
+#
+# It needs qemu-user-static with binfmt_misc registered (the image's own aarch64
+# apk runs the package scripts), the cross toolchain and host apk that an
+# E5_DOCKER=none openwrt/build-modemmanager.sh leaves in /build/openwrt, and the
+# host's e2fsprogs.  What was measured, and the traps, are in docs/FINDINGS.md 65.
+#
 # The tree is OpenWrt's own armsr/armv8 root filesystem (arm64, musl) with the
 # E5's parts added -- no kernel, no kmods: the E5 boots its vendor kernel from
 # slot b's boot image, and the initramfs starts this tree from a directory of
@@ -62,8 +73,8 @@
 # for the mainline kernel) next to the 5.15 ones; the image then runs on either kernel.
 # E5_ROOT_MODULES_ONLY=1 uses only that archive, without a local 5.15 build.
 #
-# E5_IMAGE_MB sets the image's size (default 1024).  Needs Docker with arm64
-# (native on Apple silicon).
+# E5_IMAGE_MB sets the image's size (default 1024).  The container path needs
+# Docker with arm64 (native on Apple silicon); E5_DOCKER=none needs neither.
 set -euo pipefail
 VER=${E5_WRT_VER:-25.12.5}
 HERE="$(cd "$(dirname "$0")" && pwd)"
