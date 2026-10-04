@@ -5486,6 +5486,12 @@ The measurement lesson is the reason this paragraph exists: a keyword grep whose
 was truncated by a `tail` was read as an absence.  The line I said did not exist was in
 the same tool result, three of the six matches I printed.
 
+One more correction, because the symptom returned on a boot where nobody had called
+`ifdown`: "nobody asked it to enable" is only half the story.  After a bearer loss
+something asks it to **disable** -- netifd's stop path runs `mmcli --disable` for any
+teardown of `wan` unless the interface sets `disable_modem='0'` -- and that is what 63
+fixes.
+
 ### 62.2 The COM29 the E5 gives the host is a root shell
 
 The gadget (`0525:a4a1`, UDC `musb-hdrc.1.auto`, configfs instance `linux`) binds two
@@ -5514,3 +5520,94 @@ Measured on the resulting package: `modemmanager release 8 -> 914`, i.e. the fee
 claimed.  The phone came with **r911** installed.  `1805436` bytes and an `Apr 10 2025`
 mtime were identical for the old and the new daemon, so neither size nor date can tell the
 two builds apart -- compare sha256, or grep the binary for a string only the patch adds.
+
+## 63. 「搜索网络」 with a working network: netifd puts the modem in flight mode when it loses the bearer
+
+The screen said 搜索网络 with no signal, and the CP said otherwise: `AT+CFUN?` = 1,
+`AT+COPS?` = `0,0,"CHN-TELECOM",11`, `AT+CGATT?` = 1.  `mmcli -m 0` was in the middle:
+`state: disabled`, `packet service state: detached`, so the 3GPP interface was never
+queried and `/api/status` returned `operator: null, registration: null, quality: 0` --
+which is exactly what app.js renders as 搜索网络.  Section 62.1 blamed this on our power-up
+path never enabling the modem; that was wrong twice: netifd does enable (62.1), and the
+`disabled` state was not a missing enable but an explicit **disable** on teardown.
+
+### 63.1 The teardown, from the log of the boot that did it
+
+wan autostarted and dialled properly -- `21:57:44 Network device 'sipa_eth0' link is up`,
+then `connected`, operator 46011.  62 s later (`connection #1 finished: duration 62s`):
+
+    21:58:47 kern sipa_dele: smsg_recv, ... chan=120, type=5, flag=0x2, value=0x00000000
+    21:58:47 netifd: Interface 'wan_6' is disabled
+    21:58:47 netifd: Network alias '' link is down
+    21:58:47 netifd: Interface 'wan_6' has link connectivity loss
+    21:58:47 netifd: wan (9272): stopping network
+    21:58:47 MM    [modem0] processing user request to disable modem...
+    21:58:50 MM    3GPP registration state changed (home -> unknown)
+    21:58:50 MM    access technology changed (5gnr -> unknown)
+    21:58:50 netifd: wan (9272): successfully disabled the modem
+
+and nothing brought it back in the following twenty minutes (`ifstatus wan` =
+`"up": false, "autostart": false`).  One transient loss of the data link therefore costs
+the registration, the signal reading and the whole hotspot, permanently.
+
+The disable is not ModemManager's doing.  `/lib/netifd/proto/modemmanager.sh:878-882`:
+
+    local disable="$(uci_get network "$interface" disable_modem "1")"
+    if [ "${disable}" -eq 0 ]; then echo "Skipping modem disable"
+    else mmcli --modem="${device}" --disable; fi
+
+`disable_modem` defaults to 1: every stop of wan -- whatever caused it -- flight-modes the
+modem.  A bearer loss is not a reason to leave the network, so the E5 now sets it to 0
+(`openwrt/overlay/etc/uci-defaults/90-e5`, in the batch for new configs and in a small
+repair before the `configured.network` early exit, so a reinstall over an existing
+`/etc/config/network` gets it too).
+
+Measured on the device after `uci set network.wan.disable_modem=0`, taking wan down
+on purpose:
+
+    netifd: wan (14857): Skipping modem disable
+    mmcli:  state: registered / packet service state: attached / operator id: 46011
+    api:    operator "CHN-TELECOM", registration "home", tech "5gnr", quality 100, rsrp -80
+
+The screen keeps the carrier, the technology and the signal bars across a bearer loss.
+
+### 63.2 What that does not fix: the data path stays down
+
+`ip link set sipa_eth0 down` reproduces netifd's half of the sequence (wan_6 loses the
+link, goes down, is disabled) without reproducing the CP-side release, and it shows the
+rest of the damage: the parent `wan` still reports `"up": true` and ModemManager stays
+`connected`, but **the default route is gone** and `ping` answers `Network unreachable`.
+`ip link set sipa_eth0 up` does not restore it; only `ifup wan` (a fresh dial) does.
+
+Two ways to close that were measured and rejected:
+
+* `option force_link='1'` on wan does not keep the dynamic `wan_6` child alive -- applied,
+  re-tested, sequence unchanged, so the option was reverted rather than shipped.
+* a hotplug handler that re-dials on `if-down` cannot be written safely in this build:
+  `strings /sbin/netifd | grep -aiE 'reason|ifdown'` yields only `ifdown`, i.e. there is no
+  `IFDOWN_REASON`-style plumbing, so a handler could not tell an operator's deliberate
+  `ifdown` (the way a data-capped SIM is protected) from a link loss.  Auto-redial would
+  fight that, so it is not installed.
+
+Still open: why the CP released the sipa data link 62 s after the first dial.  It did not
+recur in the next ten minutes (22:26-22:36, bearer up the whole time), so it is
+intermittent; the kernel lines around it are `sipa_rm SIPA_RM_RES_CONS_WWAN_DL/UL`
+toggling `2->0` and `0->1->2` every ~10 s throughout.
+
+### 63.3 Traffic accounting for this session (the capped SIM)
+
+`/proc/net/dev` on `sipa_eth0`, cumulative for one boot: after the boot dial
+`rx 18675 / tx 7743`; after three short test dials `rx 138442 / tx 141479`.  My own
+requests were two `ping -c 1/-c 2` packets to 223.5.5.5, so the growth is not mine:
+`br-lan rx 291967 / tx 450694` and `usb0 rx 295701 / tx 609480` say the attached **host
+PC is using the bearer as its default gateway**, and Windows background traffic is what
+drains the card.  With a 10 MB SIM that is the thing to watch, not the probes.
+
+### 63.4 Driver note: this busybox has no `stty`
+
+`repo-status/_e5sh.py` ran `stty -echo 2>/dev/null` at login, which this device answers
+with `ash: stty: not found` -- silenced by the redirect, so echo stayed on and long
+command lines silently lost bytes (measured: a 320-character line arrived as 176 bytes).
+That is what truncated the script uploads.  The driver now matches the *last* occurrence
+of both markers, writes in <=150-byte pieces and reads `wc -c` back after every one, so a
+lost byte fails loudly instead of shipping half a script.
