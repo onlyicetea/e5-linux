@@ -86,6 +86,20 @@ IMAGE_MB=${E5_IMAGE_MB:-1024}
 FIRMWARE=${E5_FIRMWARE:-$TOP/rootfs/overlay/lib/firmware}
 ANDROID=${E5_ANDROID_SUBSET:-$TOP/work/android-subset}
 KBUILD=${E5_KBUILD:-$TOP/out_linux}
+# E5_DOCKER=none builds on the host instead of in containers, the way
+# openwrt/build-modemmanager.sh does.  Three of the steps below run aarch64 code
+# (the image's own apk, its /bin/sh, the static busybox), so the host needs
+# qemu-user with binfmt_misc registered -- on WSL that is
+# `apt-get install qemu-user-static` plus writing the package's own
+# /usr/lib/binfmt.d/qemu-aarch64.conf into /proc/sys/fs/binfmt_misc/register,
+# which WSL does not do at boot.  The image assembly is not rewritten for the
+# host: it runs in a chroot of the unpacked base rootfs, so the commands are this
+# script's own and the two paths cannot drift apart.  The OpenWrt tree that
+# build-modemmanager.sh made supplies the cross compiler for the four helpers.
+NATIVE=0
+[ "${E5_DOCKER:-docker}" = none ] && NATIVE=1
+CHROOT=$WORK/chroot
+E5_OPENWRT=${E5_OPENWRT:-/build/openwrt}
 mkdir -p "$WORK" "$OUT"
 
 # the Argon theme: not in OpenWrt's feeds; its release's packages (arch all)
@@ -118,12 +132,29 @@ have=$(shasum -a 256 "$WORK/$TARBALL" 2>/dev/null || sha256sum "$WORK/$TARBALL")
 [ -n "$want" ] && [ "${have%% *}" = "$want" ] || { echo "checksum mismatch for $TARBALL" >&2; exit 1; }
 
 # logdw, e5-vibrate, e5-ctl-raw and e5-modemd, static: OpenWrt has no compiler of its own
+if [ "$NATIVE" = 1 ]; then
+    # the same four programs, cross-compiled with the toolchain the package build made
+    XGCC=$(ls "$E5_OPENWRT"/staging_dir/toolchain-aarch64_generic_gcc-*/bin/aarch64-openwrt-linux-musl-gcc 2>/dev/null | head -1)
+    [ -n "$XGCC" ] && [ -x "$XGCC" ] || {
+        echo "no aarch64 cross compiler under $E5_OPENWRT/staging_dir -- run openwrt/build-modemmanager.sh with E5_DOCKER=none first, or set E5_OPENWRT" >&2; exit 1; }
+    echo "helpers: $("$XGCC" --version | head -1)"
+    "$XGCC" -static -Os -s -o "$WORK/logdw" "$HERE/src/logdw.c"
+    for s in e5-vibrate e5-ctl-raw e5-modemd; do
+        "$XGCC" -static -Os -s -Wall -o "$WORK/$s" "$HERE/src/$s.c"
+    done
+    # (a helper that came out x86-64 or dynamic would boot but not run)
+    for s in logdw e5-vibrate e5-ctl-raw e5-modemd; do
+        file "$WORK/$s" | grep -q "ARM aarch64" || { echo "$s is not aarch64: $(file "$WORK/$s")" >&2; exit 1; }
+        file "$WORK/$s" | grep -q "statically linked" || { echo "$s is not static: $(file "$WORK/$s")" >&2; exit 1; }
+    done
+else
 docker run --rm --platform linux/arm64 -v "$HERE/src":/src:ro -v "$WORK":/out "${E5_TOOLS_BUILD_IMAGE:-alpine:3.22}" \
     sh -euc 'if ! command -v gcc >/dev/null; then apk add -q gcc musl-dev linux-headers >/dev/null; fi
         gcc -static -Os -s -o /out/logdw /src/logdw.c &&
         gcc -static -Os -s -Wall -o /out/e5-vibrate /src/e5-vibrate.c &&
         gcc -static -Os -s -Wall -o /out/e5-ctl-raw /src/e5-ctl-raw.c &&
         gcc -static -Os -s -Wall -o /out/e5-modemd /src/e5-modemd.c'
+fi
 
 # what a standalone image carries of the device's own (the Debian root's in the
 # directory form); an empty directory each otherwise
@@ -184,18 +215,46 @@ if [ -n "$STANDALONE" ]; then
     # Noto Sans CJK from Debian's package, once
     if ! ls "$WORK/fonts/"NotoSansCJK-Regular.ttc >/dev/null 2>&1; then
         mkdir -p "$WORK/fonts"
+        if [ "$NATIVE" = 1 ]; then
+            # the same package, unpacked on the host: apt-get download needs no
+            # container, the package is Architecture: all, and dpkg-deb -x runs
+            # nothing from it
+            ( cd "$WORK" && rm -rf fonts-deb && mkdir fonts-deb && cd fonts-deb &&
+              apt-get update -qq && apt-get download -qq fonts-noto-cjk &&
+              dpkg-deb -x fonts-noto-cjk_*.deb x &&
+              cp x/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
+                 x/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc "$WORK/fonts/" )
+            ls "$WORK/fonts/"NotoSansCJK-*.ttc >/dev/null || { echo "no Noto Sans CJK from the host's apt" >&2; exit 1; }
+        else
         docker run --rm --platform linux/arm64 -v "$WORK/fonts":/out debian:trixie-slim sh -euc '
             cd /tmp && apt-get update -qq && apt-get download -qq fonts-noto-cjk &&
             dpkg-deb -x fonts-noto-cjk_*.deb x &&
             cp x/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
                x/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc /out/'
+        fi
     fi
     cp "$WORK/fonts/"NotoSansCJK-*.ttc "$SA/fonts/"
 fi
 
 # (the standalone tree is only the image's source)
 TAROUT=$OUT; [ -z "$STANDALONE" ] || TAROUT=$WORK
+if [ "$NATIVE" = 1 ]; then
+    # what `docker import` did: the base rootfs as a directory to assemble in
+    rm -rf "$CHROOT"; mkdir -p "$CHROOT"
+    tar -xzf "$WORK/$TARBALL" -C "$CHROOT"
+    for d in bin etc lib sbin usr; do
+        [ -e "$CHROOT/$d" ] || { echo "the base rootfs has no /$d -- not $TARBALL?" >&2; exit 1; }
+    done
+    mkdir -p "$CHROOT/build" "$CHROOT/tmp" "$CHROOT/dev" "$CHROOT/proc"
+    # apk in the chroot needs DNS.  The base rootfs's resolv.conf is a symlink to
+    # /tmp/resolv.conf, which is dangling here and cp refuses to write through, so
+    # it goes first; the assembly puts the symlink back in the image it writes.
+    rm -f "$CHROOT/etc/resolv.conf"
+    cp /etc/resolv.conf "$CHROOT/etc/resolv.conf"
+    echo "base rootfs unpacked: $(du -sh "$CHROOT" | cut -f1)"
+else
 docker import --platform linux/arm64 "$WORK/$TARBALL" e5-openwrt-base:$VER >/dev/null
+fi
 # Packages OpenWrt's repository dropped -- cog and WPE WebKit left 25.12.5's feed when it was regenerated on
 # 2026-09-28 -- are taken from the last image that had them: their files, apk database entries and
 # dependencies, out of that image's rootfs archive into $WORK/transplant once (kept there).  The build uses
@@ -240,6 +299,62 @@ mkdir -p "$WORK/no-infoscreen"
 echo "info screen: ${INFOSCREEN:-(none)}"
 VERSION=$(git -C "$TOP" describe --always --dirty 2>/dev/null || echo dev)
 
+if [ "$NATIVE" = 1 ]; then
+    # The container's mount points, as bind mounts of the same directories, so
+    # the assembly below is this script's own text and not a copy of it.
+    MOUNTS=
+    bind() { mkdir -p "$2"; mount --bind "$1" "$2"; MOUNTS="$2 $MOUNTS"; }
+    bindf() { mkdir -p "$(dirname "$2")"; [ -e "$2" ] || touch "$2"; mount --bind "$1" "$2"; MOUNTS="$2 $MOUNTS"; }
+    unbind() { for m in $MOUNTS; do umount "$m" 2>/dev/null || umount -l "$m"; done; }
+    bind /dev "$CHROOT/dev"
+    mount -t proc proc "$CHROOT/proc"; MOUNTS="$CHROOT/proc $MOUNTS"
+    bind "$HERE/overlay" "$CHROOT/in/overlay"
+    bind "$TOP/rootfs/overlay/opt/e5" "$CHROOT/in/opt-e5"
+    bind "$OUT" "$CHROOT/in/apk"
+    bindf "$BUSYBOX" "$CHROOT/in/busybox"
+    bindf "$WORK/logdw" "$CHROOT/in/logdw"
+    bindf "$WORK/e5-vibrate" "$CHROOT/in/e5-vibrate"
+    bindf "$WORK/e5-ctl-raw" "$CHROOT/in/e5-ctl-raw"
+    bindf "$WORK/e5-modemd" "$CHROOT/in/e5-modemd"
+    bind "${INFOSCREEN:-$WORK/no-infoscreen}" "$CHROOT/in/infoscreen"
+    bind "${SCREEN_PLUGINS:-$WORK/no-infoscreen}" "$CHROOT/in/infoscreen-plugins"
+    bind "$TOP/rootfs/overlay/usr/share/alsa" "$CHROOT/in/alsa"
+    bind "$SA" "$CHROOT/in/sa"
+    bind "$RM" "$CHROOT/in/root-modules"
+    bind "$WORK/extra" "$CHROOT/in/extra"
+    bind "$TP" "$CHROOT/in/transplant"
+    bind "$TAROUT" "$CHROOT/out"
+
+    # the assembly commands, taken out of this script: the quoted form the
+    # container gets, with the '\'' escapes turned back into apostrophes
+    # (they are all in comments, but a stray one would be a syntax error)
+    sed -n "/\/bin\/sh -euc '/,/^'\$/p" "$0" | sed '1d;$d' > "$WORK/inner-rootfs.sh"
+    n=$(wc -l < "$WORK/inner-rootfs.sh")
+    [ "$n" -gt 100 ] || { unbind; echo "only $n assembly lines extracted from $0" >&2; exit 1; }
+    esc=$(grep -c "'\"'\"'" "$WORK/inner-rootfs.sh" || true)
+    sed -i "s/'\"'\"'/'/g" "$WORK/inner-rootfs.sh"
+    left=$(grep -c "'\"'\"'" "$WORK/inner-rootfs.sh" || true)
+    echo "assembly script: $n lines, $esc apostrophe escapes unquoted, $left left"
+    [ "$left" = 0 ] || { unbind; echo "apostrophe escapes survived the unquoting" >&2; exit 1; }
+    # (the two ends of it must be there, or the extraction silently found nothing)
+    grep -q "^apk add --allow-untrusted /in/apk/modemmanager-1\*\.apk" "$WORK/inner-rootfs.sh" || {
+        unbind; echo "the extracted script does not install ModemManager" >&2; exit 1; }
+    grep -q '^cd \$R && tar -czf /out/\$NAME \.' "$WORK/inner-rootfs.sh" || {
+        unbind; echo "the extracted script does not write the image" >&2; exit 1; }
+    sh -n "$WORK/inner-rootfs.sh" || { unbind; echo "the extracted assembly script does not parse" >&2; exit 1; }
+    cp "$WORK/inner-rootfs.sh" "$CHROOT/tmp/build.sh"
+
+    echo "== native assembly (E5_DOCKER=none): chroot $CHROOT, qemu/binfmt runs its aarch64 apk"
+    set +e
+    env -i PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root TERM=dumb \
+        STANDALONE="$STANDALONE" NAME="$NAME" VERSION="$VERSION" \
+        E5_BUILD_EPOCH="${E5_BUILD_EPOCH:-}" EXTRA_LIST="$EXTRA_LIST" \
+        chroot "$CHROOT" /bin/sh -eu /tmp/build.sh
+    rc=$?
+    set -e
+    unbind
+    [ "$rc" = 0 ] || { echo "the image assembly failed (rc=$rc)" >&2; exit "$rc"; }
+else
 docker run --rm --platform linux/arm64 \
     -v "$HERE/overlay":/in/overlay:ro -v "$TOP/rootfs/overlay/opt/e5":/in/opt-e5:ro \
     -v "$OUT":/in/apk:ro -v "$BUSYBOX":/in/busybox:ro -v "$WORK/logdw":/in/logdw:ro \
@@ -411,11 +526,31 @@ else date -u +%s > $R/etc/e5/build-time; fi
 cd $R && tar -czf /out/$NAME .
 ls -la /out/$NAME
 '
+fi
 
 [ -n "$STANDALONE" ] || exit 0
 # the tree as an ext4 image (mke2fs -d: no loop device, no root on the host)
 IMG=e5-openwrt-$VER.ext4
 [ "$DEVICE_FILES" != 0 ] || IMG=e5-openwrt-$VER-generic.ext4
+if [ "$NATIVE" = 1 ]; then
+    # the same commands with the container's two mount points rewritten to the
+    # directories they were mounts of (-v "$WORK":/w -v "$OUT":/out below), and
+    # its package install replaced by a check for the host's own e2fsprogs
+    # (the range is anchored on the block's own first and last lines: a pattern
+    # naming the container image would match this very sed)
+    sed -n "/^apk add -q e2fsprogs/,/gz'\$/p" "$0" | sed "\$ s/'\$//" > "$WORK/inner-mkimg.sh"
+    [ "$(wc -l < "$WORK/inner-mkimg.sh")" -gt 5 ] || { echo "no image commands extracted from $0" >&2; exit 1; }
+    sed -i -e "s|^apk add -q e2fsprogs >/dev/null\$|command -v mke2fs >/dev/null|" \
+           -e "s|/w/|$WORK/|g" -e "s|/out/|$OUT/|g" "$WORK/inner-mkimg.sh"
+    grep -q "^command -v mke2fs" "$WORK/inner-mkimg.sh" || { echo "the e2fsprogs install was not replaced" >&2; exit 1; }
+    # what the two ends of it must now say.  A bare "/out/" is not a usable check:
+    # the path it was rewritten to contains one.
+    grep -qF "tar -xzf $WORK/\$NAME" "$WORK/inner-mkimg.sh" || { echo "the tarball path was not rewritten" >&2; exit 1; }
+    grep -qF "ls -la $OUT/\$IMG.gz" "$WORK/inner-mkimg.sh" || { echo "the image path was not rewritten" >&2; exit 1; }
+    if grep -qF '/w/' "$WORK/inner-mkimg.sh"; then echo "a /w/ mount point survived:" >&2; grep -nF '/w/' "$WORK/inner-mkimg.sh" >&2; exit 1; fi
+    sh -n "$WORK/inner-mkimg.sh" || { echo "the image script does not parse" >&2; exit 1; }
+    NAME="$NAME" IMG="$IMG" MB="$IMAGE_MB" sh -e "$WORK/inner-mkimg.sh"
+else
 docker run --rm --platform linux/arm64 -v "$WORK":/w -v "$OUT":/out \
     -e NAME="$NAME" -e IMG="$IMG" -e MB="$IMAGE_MB" alpine:3.22 sh -euc '
 apk add -q e2fsprogs >/dev/null
@@ -427,3 +562,4 @@ gzip -1 -c /w/$IMG > /out/$IMG.gz.part && mv /out/$IMG.gz.part /out/$IMG.gz
 rm -f /w/$IMG
 echo "used: $(du -sh /tmp/r | cut -f1) of ${MB} MiB"
 ls -la /out/$IMG.gz'
+fi
