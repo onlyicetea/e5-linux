@@ -5705,3 +5705,153 @@ loop was then measured end to end:
 
 The `--rearm` line is the proof the mechanism now runs on its own; before the change the
 same boot logged `default boot is not linux, nothing to do` instead.
+
+## 65. The image can be built on a host with no container runtime, and what that took
+
+Both fixes of 63.5 and 64 were in the tree, but nothing on the build machine could turn
+them into an image: `openwrt/build-rootfs.sh` ran five container steps and had no host
+path (only `build-modemmanager.sh` had one), and `openwrt/make-flash-bundle.sh:11` says
+the same thing from the other side (`E5_IMAGE_FROM` exists because "build-rootfs.sh needs
+docker").  Docker is not an option on this machine, so the image had to come from CI --
+which is a 51 minute round trip through a fork's runner for a change of one line.
+
+What was measured before any code was written, because the obvious assumption was wrong:
+
+* the OpenWrt tree the package build leaves in `/build` has a **host** apk:
+  `staging_dir/host/bin/apk`, `apk-tools 3.0.5, compiled for x86_64`, and OpenWrt drives
+  it exactly this way for its own arm64 images (`include/rootfs.mk:48`:
+  `IPKG_INSTROOT=$(1) $(FAKEROOT) $(STAGING_DIR_HOST)/bin/apk --root $(1) --keys-dir ...
+  --no-logfile --preserve-env`).  An x86_64 apk installing into an aarch64 root is not a
+  trick, it is how the release images are built.
+* against the unpacked armsr rootfs: `update` gave `OK: 11170 distinct packages
+  available`, `add iwinfo` put `libiwinfo.so.20230701` in the target root and wrote its
+  database and world, `search`/`info`/`del` all rc=0.
+* the one real gate: apk execve's a package's `post-install` inside the target root, so on
+  x86_64 it died with `* execve: Exec format error` and `add` returned 1.
+  `qemu-user-static` is the fix, but **WSL does not register binfmt at boot** --
+  `/proc/sys/fs/binfmt_misc/` held only `register status WSLInterop` after the install.
+  Writing the package's own `/usr/lib/binfmt.d/qemu-aarch64.conf` line into
+  `/proc/sys/fs/binfmt_misc/register` gave `flags: POF`, and then `chroot $R /bin/sh -c
+  'uname -m'` printed `aarch64` and `apk add` ran the post-install with rc=0.  The `F`
+  (fix binary) flag is what makes it work inside a chroot at all.
+* `--no-scripts` and `--scripts` are not *global* options in this apk (`unrecognized
+  option`); `apk add --help` lists `--scripts[=BOOL]` and `--force-no-chroot`, so a
+  scripts-free path exists, but with binfmt it was not needed.
+
+So `E5_DOCKER=none` was added to `build-bluez.sh` (25 lines) and `build-rootfs.sh` (136),
+as additions only -- `git diff --numstat` says `25 0` and `136 0`, no container-path line
+changed.  The commands are the script's own, extracted from `$0` the way
+`build-modemmanager.sh` already did, so the two paths cannot drift; what changed is only
+how they are reached: the four static helpers cross-compile with
+`aarch64-openwrt-linux-musl-gcc` from the same staging_dir (each checked for `ARM aarch64`
+and `statically linked`), `docker import` becomes an unpack, the assembly runs in a chroot
+of that unpack with the container's mount points bind-mounted at the same `/in/...` paths
+(so the apk that installs the packages is the image's own aarch64 one), Noto Sans CJK
+comes from the host's apt (that package is `Architecture: all`), and the ext4 from the
+host's `mke2fs -d`.
+
+Three traps in doing it, each of which would have failed silently:
+
+* the assembly block cannot be located by `e5-openwrt-base:` -- the `docker import` line
+  contains that string too, and the extraction came back with 271 lines instead of 159.
+  `/bin/sh -euc '` is the unique anchor.
+* the image block cannot be located by `alpine:3.22 sh -euc '` -- the sed that does the
+  locating contains that string, so it matched itself.  It is anchored on its own first
+  and last lines instead.
+* a leftover `/out/` cannot be checked as a substring after the rewrite, because the path
+  it is rewritten to (`$TOP/out/openwrt`) contains one.  The check is for what the two
+  ends of the block must then say.
+* and the base rootfs's `/etc/resolv.conf` is a symlink to `/tmp/resolv.conf`, which is
+  dangling in a fresh unpack: `cp` refuses to write through it, so it is removed first.
+  The assembly puts the symlink back in the image it writes.
+
+The result, measured: bluez `5.83 release 1 -> 902` (five packages, about four minutes)
+and `e5-openwrt-25.12.5-generic.ext4.gz` of 150,915,480 bytes, whose own build log says
+`modemmanager 1.24.0-r915 installed`, `info screen packages: 13`, `transplanted from an
+earlier image: cog libcogcore libwpewebkit`, `used: 313M of 1024 MiB`.  Set against the
+image CI built at `30f37d5`, package by package from each image's own apk database:
+
+    new packages: 348      old packages: 348      differing lines: 4
+    < modemmanager 1.24.0-r913        > modemmanager 1.24.0-r915
+    < modemmanager-rpcd 1.24.0-r913   > modemmanager-rpcd 1.24.0-r915
+
+That is the change being built and nothing else, which is the point of building it twice.
+
+The boot image was not rebuilt.  The kernel did not change, `upstream/out-release` (Image.lk,
+modules, root-modules.tar) does not exist on this host, and `upstream/build-native.sh` --
+which would be the container-free way to make it -- has never been run by anything.  So the
+bundle reuses `boot.img`, `boot.json` and `boot-misc-slot-b.bin` byte for byte (`0370af9e...`
+on both sides) and takes the root modules out of the previous image with a loop mount: 24
+audio modules and `sipc_wwan.ko`, both vermagics `6.18.54-e5-g20f1a47fc2cb`, which is the
+directory name and the release in the reused boot image's `files/VERSION`.  `files/VERSION`
+in the new bundle says all of this rather than implying a from-scratch build.
+
+Flashing it is where the device disagreed with the tooling.  `flash.py --check` verified
+the package (all 15 SHA256SUMS entries) and found the device with root already granted
+(`uid=0 ... context=u:r:ksu:s0`), then stopped at `ro.boot.verifiedbootstate == orange`
+(`flash.py:293`).  This unit reports:
+
+    ro.boot.verifiedbootstate    green
+    ro.boot.flash.locked         1
+    ro.boot.vbmeta.device_state  locked
+    ro.boot.veritymode           enforcing
+
+while booting our own slot-b boot image, which a genuinely locked verified boot would not
+do -- the uboot is modified and the property lies.  So `install_sd` is unreachable on this
+unit.  No assertion was patched to get past it; the flasher's own `--update` path was used,
+which does not call `android_checks` and does the same work from inside the running OpenWrt.
+
+`--update` could not run from this PC either: it serves the files over HTTP on the PC and
+the device fetches them, and inbound to Windows is blocked -- the device's `wget` reported
+`Failed to send request: Operation not permitted`, and an earlier `nc` from the device to a
+listener here timed out.  So the same device-side steps were run over the direction that
+does work (the PC connects out, the device listens), with sha256 compared at both ends:
+the image (150,915,480 B in 13.8 s, `ef9c34c8...`), `e5-gpt` (`9b52feb3...`, already the
+same bytes as the device's `/usr/libexec/e5-gpt`) and `device-install-image.sh`
+(`9ee586a2...`), then `sh /tmp/dii.sh /root/openwrt.ext4.gz`.
+
+`device-flash-boot.sh` was deliberately **not** run.  It rewrites the first 56 MiB of
+boot_b; that region was verified equal to the bundle's expectation instead, which is
+stronger than rewriting identical bytes into the partition that is currently booting:
+
+    dd if=/dev/block/by-name/boot_b bs=1048576 count=56 | sha256sum
+      = cb54eaae454ebb1ba4e970ba765a98cf48d4d8e75c801eb4b71d2df2f14bead3
+      = boot.json:sha256_head56m
+    misc bootloader_control = 5f62...9e002f00...9bf8546d = boot.json:misc_slot_b_trial_hex
+
+The install, in the installer's own words:
+
+    == the card: /dev/mmcblk1, running from partition 1 (generation 0), the image 1024 MiB
+    == a new root partition on the card: e5root2 (2 2101248 4722687)
+    == keeping the configuration of /
+    == the device's files copied in
+    installed: card partition 2 (780f0f8, generation 1), started at the next boot
+
+`e5-os openwrt` then printed `openwrt is not installed` (rc=1): this card has no SD system
+registry (`/mnt/e5-boot/format` is absent), so there is nothing for the selector to select.
+Worth knowing -- `flash.py`'s `--update` runs its device-side steps under `set -e`, so it
+would have reported failure at that same point with the install already complete.
+
+After the reboot, and again after a cold one, all of it held:
+
+    root dev: /dev/mmcblk1p2   image-version: 780f0f8   sd-gen: 1   sd-trial: (gone)
+    boot/init: stage=sd-candidate /dev/mmcblk1p2 gen=1 trial
+               stage=openwrt-sd-trial /dev/mmcblk1p2
+               stage=default-boot-linux (slot a restore skipped)
+    e5-boot-ok: the card update's first boot is up: kept (780f0f8)
+    e5-boot-ok: slot b re-armed            (and again on the cold boot)
+    /lib/netifd/proto/modemmanager.sh is owned by modemmanager-1.24.0-r915
+    878: local disable="$(uci_get network "$interface" disable_modem "0")"
+    disable_modem in /etc: 0 file(s)       /etc/e5linux/default-boot: linux
+    mmcli: state connected, operator id 46011, packet service attached
+    wan up 34 s after boot, sipa_eth0; infoscreen CHN-TELECOM/home/5gnr
+    hotspot ssid Link, key sha256 b3bce63f... -- identical to the pre-install backup
+
+`stage=default-boot-linux (slot a restore skipped)` is 64's fix working in the boot chain,
+and `sd-trial` being gone is the trial having been accepted rather than merely survived.
+
+Not measured, and not claimed: whether the ~200 MB of packages this build downloaded went
+over the cellular link.  The device rebooted twice before its counters were read, so the
+window is gone; the PC's route table has the E5's `usb0` at metric 8000 behind a metric-50
+default, which is indirect evidence only.  G1 (a boot with no card) and G3 (广电 46015/NR,
+the dual-slot matrix, `e5-sim`) are still unrun.
