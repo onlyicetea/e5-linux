@@ -5557,10 +5557,8 @@ The disable is not ModemManager's doing.  `/lib/netifd/proto/modemmanager.sh:878
     else mmcli --modem="${device}" --disable; fi
 
 `disable_modem` defaults to 1: every stop of wan -- whatever caused it -- flight-modes the
-modem.  A bearer loss is not a reason to leave the network, so the E5 now sets it to 0
-(`openwrt/overlay/etc/uci-defaults/90-e5`, in the batch for new configs and in a small
-repair before the `configured.network` early exit, so a reinstall over an existing
-`/etc/config/network` gets it too).
+modem.  A bearer loss is not a reason to leave the network, so the default becomes 0.  How
+that ships is in 63.5 (a package patch, not a hand-set option in `/etc/config/network`).
 
 Measured on the device after `uci set network.wan.disable_modem=0`, taking wan down
 on purpose:
@@ -5589,10 +5587,12 @@ Two ways to close that were measured and rejected:
   `ifdown` (the way a data-capped SIM is protected) from a link loss.  Auto-redial would
   fight that, so it is not installed.
 
-Still open: why the CP released the sipa data link 62 s after the first dial.  It did not
-recur in the next ten minutes (22:26-22:36, bearer up the whole time), so it is
-intermittent; the kernel lines around it are `sipa_rm SIPA_RM_RES_CONS_WWAN_DL/UL`
-toggling `2->0` and `0->1->2` every ~10 s throughout.
+Still open then, and open now: why the CP releases the sipa data link at all.  It is not a
+60 s timer -- later sightings are 23:09:12 and 23:43:47, at 43 s and 88 s of bearer life --
+and the kernel's `sipa_rm SIPA_RM_RES_CONS_WWAN_DL/UL` toggles `2->0` and `0->1->2` every few
+seconds the whole time the bearer is up, so a carrier blip on `sipa_eth0` is normal traffic
+here and only the long one matters.  63.5 has what one of them looks like without my
+intervention, and what still goes wrong in that case.
 
 ### 63.3 Traffic accounting for this session (the capped SIM)
 
@@ -5611,3 +5611,97 @@ command lines silently lost bytes (measured: a 320-character line arrived as 176
 That is what truncated the script uploads.  The driver now matches the *last* occurrence
 of both markers, writes in <=150-byte pieces and reads `wc -c` back after every one, so a
 lost byte fails loudly instead of shipping half a script.
+
+### 63.5 The fix is in the package, not in a config I set by hand
+
+63.1 left the fix sitting in `90-e5`, which meant it only reached a device whose
+`/etc/config/network` the script was allowed to write, and it left every device I had not
+touched broken.  That is not a product fix, so it moved down a layer: the default of
+netifd's own option is changed in the shipped proto script
+(`openwrt/patches/modemmanager-package-no-flight-mode.patch`, E5REV 6 -> 7, so
+`modemmanager-1.24.0-r915.apk`), and the `90-e5` option went away again -- one mechanism.
+`option disable_modem '1'` still asks for the old behaviour per interface.
+
+Measured after installing r915 with **`disable_modem` removed from `/etc/config/network`
+altogether** (`grep -c disable_modem /etc/config/network` = 0):
+
+    23:44:55 netifd: wan (19383): Skipping modem disable
+    mmcli   : state: registered / packet service state: attached / operator id: 46011
+    api     : operator "CHN-TELECOM", registration "home", tech "5gnr", quality 100
+    23:45:42 ifup wan -> "up": true, ping 1/1
+
+and after a cold reboot at 23:47:52 the same device came up by itself dialling:
+`23:49:32 Interface 'wan' is now up`, `state: connected`, API `quality 100`, ping 1/1, with
+23 KB (`rx 14568 / tx 8604`) for the whole boot.
+
+Two of my own bugs showed up on the way and are worth recording because they were silent:
+
+* `_e5xfer.py`/`_e5run.py` stripped `\r\n` from every file they pushed -- harmless for
+  scripts, corrupting for a binary payload, and the sha check could not see it because it
+  compared the transformed bytes on both sides.  The first r915 install therefore died with
+  `unable to select packages: .../modemmanager-rpcd-...apk (no such package)`.
+* `apk add -U` refreshes the repository indexes, i.e. it reaches for the network even when
+  the two `.apk` files are already on the device.  With `wan` down it failed as
+  `wget: Operation not permitted`; without `wan` down it would have spent the capped SIM's
+  data.  The r914 install used plain `apk add --allow-untrusted <files>`, and that is what
+  works.
+
+A third test result refines 63.1: the `wan_6` link loss and the parent teardown are two
+separate events.  The spontaneous one at 23:09:12 (no operator action at all) was
+
+    23:09:12 kern sipa_rm: SIPA_RM_RES_CONS_WWAN_DL state changed 2->0
+    23:09:12 netifd: Network device 'sipa_eth0' link is down
+    23:09:12 netifd: Interface 'wan_6' has link connectivity loss -> is now down -> is disabled
+
+with **no `proto_mm_stop` line at all** -- the parent was never stopped, and ModemManager
+stayed `connected`.  The damage in that case was the address and the default route going
+with the carrier while `ifstatus wan` still answered `"up": true`; it healed again by
+itself within the next two minutes.  So the fatal 21:58:47 variant (parent stopped, modem
+flight-moded, 20 min of nothing) is the one the package fix removes, and the
+"up-but-no-route" variant is a separate, still-open netifd/sipa interaction.
+`option force_link='1'` was tested in both places -- on the interface and on a
+`config device` section for `sipa_eth0` -- and neither kept `wan_6` alive, so it is not the
+answer and is not in the configuration.
+
+## 64. A reboot from the card came back in Android: the card install never made itself
+## the default boot
+
+`reboot` inside the SD-form Linux at 22:55:17 put the phone in **Android**: no `192.168.9.x`
+adapter on the PC, no COM29, `adb devices` showing `ums9158_1h10` with `ro.boot.slot_suffix=_a`,
+and telnet to 192.168.9.1 "succeeding" only because the local fake-IP TUN answers anything.
+That last one is the trap: a TCP connect that succeeds from `198.18.0.1` is the proxy, not
+the device -- `getsockname()` has to be the bridge address before any of it counts.
+
+The chain is documented and was simply never closed for a card install.  `boot/init`
+(`e5-linux/boot/init:670`) restores slot a unless the rootfs says
+`/etc/e5linux/default-boot = linux`, and `e5-boot-ok` only re-arms slot b when that file
+says linux (`e5-next-boot --rearm` printed exactly `default boot is not linux, nothing to do`
+at 23:01:39).  Nothing wrote that file:
+
+* `92-e5-default-boot` ran, but its gate was `E5_DEFAULT_BOOT=linux` from
+  `/etc/e5/install.conf`, which a card install does not set;
+* the other route -- `flash.py --boot-openwrt` writing `openwrt-default-boot=linux` into
+  Android's userdata, which `e5-boot-ok` reads at `/mnt/e5-data/e5linux/` -- cannot work on
+  the card form either, because in this shape the phone's userdata is not mounted at all
+  (`/mnt/*/e5linux` does not exist, `ls` says so).
+
+So the card boots, works, and hands the next boot back to Android.  A hotspot that turns
+itself into a different operating system on reboot is not a product, and the user's own
+`rom/boot-linux.bat` existing at all is the same symptom.
+
+Fix, at the source (`openwrt/overlay/etc/uci-defaults/92-e5-default-boot`): a card in the
+slot is the system the user put there, so `/etc/e5/sd-root` alone is the request to keep it.
+`e5-next-boot linux` refuses a trial image (`e5.openwrt=` on the kernel command line), so a
+test boot still cannot make itself permanent, and `e5-next-boot android` still wins because
+the script stops when `/etc/e5linux/default-boot` already exists.
+
+On this device the state was set by hand for the moment (`e5-next-boot linux`), and the
+loop was then measured end to end:
+
+    before: misc bootloader_control = 5f61...9f001e...   (slot a -- Android)
+    after : 5f62000042434142010200009e002f...           (slot b armed, tries 2)
+    reboot 23:47:52 -> 23:50:50 up 2 min, still Linux, still slot b
+    23:48:29 user.notice e5-boot-ok: slot b re-armed
+
+The `--rearm` line is the proof the mechanism now runs on its own; before the change the
+same boot logged `default boot is not linux, nothing to do` instead.
