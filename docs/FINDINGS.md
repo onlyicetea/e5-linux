@@ -5405,3 +5405,100 @@ and SHA-256 manifest.
 The UFI-TOOLS main repository has separate commits removing both TG group and
 TG channel links and replacing the external donation QR with the user-provided
 `donate.jpg` byte-for-byte. The mirrored Debian overlay carries the same assets.
+
+## 62. 无模组 explained and fixed: a stack on an empty SIM slot asserted the CP (2026-10-04)
+
+The unisoc plugin's power-up from `+CFUN: 0` attached **both** slots unconditionally, so
+whenever one slot was empty it ran `+SFUN=2` and `+SFUN=4` for a slot holding no card and
+the CP asserted -- `T_P_ATC PS CP assert in file mnphone_api.c line 7401`, the third
+assert of 47.3.  The assert silences the CP's AT server until the CP is reset, which
+modem_control left on its own does only after minutes, so every command afterwards timed
+out, ModemManager marked the modem invalid after ten of them, `mmcli -L` answered *No
+modems were found*, and the info screen showed 「无模组」.  ModemManager replays the same
+power-up from its event cache at every start, so it re-asserted on every boot.
+
+Nothing on the SIM side was involved, which is what settled it -- the same signature came
+out of three different card states:
+
+    no card in either slot        two boots (17:35, 17:40)                    7401
+    广电 (46015) in slot 1        17:42, plus a single-variable run on the port    7401
+    电信 (46011) in slot 1        the boot after the swap, at t=41.4 s         7401
+
+The single-variable run is the one that made the case: bringing up **only** card 0
+(`+SPACTCARD=0;+SFUN=2`, `+SPTESTMODEM=134,134`, `+SPSWDATA`, `+SPACTCARD=0;+SFUN=4`)
+left no assert at all and the CP went on to `+CFUN: 1` and reported its networks; then
+touching card 1 raised the assert counter from 3 to 4.
+
+The fix (patch 07, E5REV 6) reads the slots first, with `+SPACTCARD=n;+CCID?` on each --
+an error or an empty `+CCID:` is no card, the same test the SIM list uses -- and sends the
+SIM power, the work mode and the stack only to the slots that answered.  `+CFUN?` is still
+asked, so a phone with no card at all behaves as before.  `+CPIN?` was deliberately **not**
+used as the gate: a command that fails inside that sequence returns through
+`g_task_return_error`, `modem_power_up` then fails and the modem is dropped -- the very
+symptom being removed.
+
+Built on WSL (62.3) and installed the same day: `modemmanager-1.24.0-r914.apk`, added with
+`apk add --allow-untrusted` over the USB bridge link, old daemon kept at
+`/root/e5-mm-backup/ModemManager` (its sha differs from the installed one, which is the
+only way to tell them apart -- see 62.3).  Verified with the 电信 card in slot 1 and slot 2
+empty, `wan` held down the whole time so the card's data was never used:
+
+    asserts before / after starting ModemManager    0 / 0     "timed out" lines   0
+    mmcli -L                                        lists /org/.../Modem/0
+    sim slot paths                                  slot 1: /Sim/0 (active), slot 2: none
+    IMSI 460110030221044   ICCID 89860316240221719513   operator id 46011
+    the CP directly: +CFUN: 1  +CPIN: READY  +CGATT: 1  +COPS: 0,2,"46011",11 (NR)
+
+Two gates stay open: with **no card at all** the phone should now list a modem instead of
+asserting (the cleanest form of the same test), and the 广电 card has to come back for
+registration, data, and both slots filled -- `e5-sim` must keep working.
+
+### 62.1 What the fix exposed: ModemManager leaves the modem `disabled` after our power-up
+
+With the assert gone, a second layer appeared, and it predates patch 07 -- under the old
+package the modem was dropped before this layer could be seen.  `mmcli` reports
+`state: disabled` while the CP is at `+CFUN: 1` and attached, so the 3GPP interface is
+never queried: the status API returns `operator: null, registration: null` and the screen
+falls back to 「搜索网络」 even though `quality: 97` says there is signal.  Asking MM
+directly fixes it in about two seconds:
+
+    mmcli -m 0 -e 1     -> "successfully enabled the modem"
+    3GPP registration (unknown -> registering -> home), packet service (unknown -> attached)
+    state changed (enabled -> registered);  operator CHN-TELECOM, tech 5gnr
+
+Two ready-made explanations were measured and dismissed.  It is not "MM read `+CFUN: 0` at
+init and never looked again": restarting MM while `+CFUN` was already 1 still produced
+`disabled`.  And it is not netifd's job: the OpenWrt `modemmanager` protocol issues
+`--simple-connect`, `--set-allowed-modes`, `--pin` and status polling, and contains **no**
+`--enable` at all.  What is left is our own power-up path -- it raises the SIM and the
+stack and then never reports the modem as enabled, so nothing enables it until some client
+asks.
+
+### 62.2 The COM29 the E5 gives the host is a root shell
+
+The gadget (`0525:a4a1`, UDC `musb-hdrc.1.auto`, configfs instance `linux`) binds two
+functions: `ncm.usb0`, which is the `UsbNcm` adapter and the 192.168.9.1 bridge, and
+`acm.GS0`, which Windows enumerates as COM29 (`\Device\USBSER000`).  On the guest that is
+`/dev/ttyGS0`, and `/etc/inittab` runs `ttyGS0::askfirst:/usr/libexec/login.sh` behind
+`/bin/login -f root`: asserting DTR/RTS and writing a CR returns the OpenWrt banner and a
+**root shell with no password**.  It is a control path that survives a disabled NCM
+adapter or a broken network -- and a physical-access hole, so it should not be described
+anywhere as password-protected.  From Windows the port is opened exclusively
+(`dwShareMode=0`; a second handle gets `err=5`), so every read and write needs its own
+timeout or the caller hangs on it.
+
+### 62.3 Building one package without a container, and what the release number really is
+
+`E5_DOCKER=none` (build-modemmanager.sh) runs the container's command list on the host
+instead, taken out of the same file so the two cannot drift apart.  It was used on WSL
+Debian 13.5 -- trixie, the same userland as the `debian:trixie` image -- with the tree on
+the ext4 root: `/mnt/...` is a 9p mount and the Windows working copy is CRLF, so the build
+ran from a Linux clone of the repository.  The only host package the container image had
+and this host did not was `curl`, which the script uses **before** it reaches the
+container, to fetch the release buildinfo.
+
+Measured on the resulting package: `modemmanager release 8 -> 914`, i.e. the feed's
+`PKG_RELEASE` is **8** for 25.12.5, not the 11 that the script's own example comment
+claimed.  The phone came with **r911** installed.  `1805436` bytes and an `Apr 10 2025`
+mtime were identical for the old and the new daemon, so neither size nor date can tell the
+two builds apart -- compare sha256, or grep the binary for a string only the patch adds.
