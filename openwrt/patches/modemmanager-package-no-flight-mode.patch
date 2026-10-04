@@ -1,0 +1,27 @@
+e5-linux: do not let netifd's modemmanager proto flight-mode the modem when
+it takes wan down.  Applied to the package directory (net/modemmanager) by
+openwrt/build-modemmanager.sh.
+
+The E5's data interface is a Unisoc SIPC netdev (sipa_eth0) whose carrier the
+baseband releases on its own: measured here, SIPA_RM_RES_CONS_WWAN_DL/UL drops
+2->0, netifd sees the link loss, and the interface teardown used to run
+`mmcli --disable` as its last step.  That leaves the modem registered with
+nothing: +CFUN? still 1, +COPS? still answers the operator, but ModemManager
+reports state disabled with no 3GPP interface, and every status surface of the
+hotspot then reads "searching for network" with no signal bars.  Losing a
+bearer is not a reason to leave the network.
+
+This is upstream's own switch, only its default changed: an interface can still
+ask for the old behaviour with `option disable_modem '1'`.
+
+--- a/files/lib/netifd/proto/modemmanager.sh
++++ b/files/lib/netifd/proto/modemmanager.sh
+@@ -875,7 +875,7 @@ proto_mm_stop() {
+ 	mm_modem_set_roaming "${device}" ""
+ 
+ 	# disable modem
+-	local disable="$(uci_get network "$interface" disable_modem "1")"
++	local disable="$(uci_get network "$interface" disable_modem "0")"
+ 	if [ "${disable}" -eq 0 ]; then
+ 		echo "Skipping modem disable"
+ 	else

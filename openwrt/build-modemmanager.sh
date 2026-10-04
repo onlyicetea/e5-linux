@@ -44,7 +44,11 @@ set -euo pipefail
 #    stack only of the slots holding a card: a stack on an empty slot asserts the CP
 #    (mnphone_api.c:7401), which silences its AT server until the CP is reset, so
 #    ModemManager timed out ten times, dropped the modem, and the phone read no card
-E5REV=6
+# 7: netifd's proto no longer flight-modes the modem when it takes wan down
+#    (patches/modemmanager-package-no-flight-mode.patch) -- the CP releases the
+#    sipa data link on its own now and then, and one such loss used to leave the
+#    phone "searching for network" with the network still in front of it
+E5REV=7
 VER=${E5_WRT_VER:-25.12.5}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 TOP="$(cd "$HERE/.." && pwd)"
