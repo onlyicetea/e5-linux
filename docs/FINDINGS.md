@@ -4117,21 +4117,31 @@ the reboot; one sent by hand over `/dev/stty_nr6` on Android was gone at the nex
 reset.  `e5-sim` warns about a card with no NR lock and never writes one.  Note: the
 info screen's "默认频段" (NR unlocked) is exactly what this device must not do.
 
-### 47.3 Bringing both stacks up: two more asserts, and the order that has none
+### 47.3 Bringing both stacks up: three asserts, and the order that has none
 
     T_P_ATC PS CP assert in file mnphone_api.c line 7048
     T_P_ATC PS CP assert in file mnphone_api.c line 7038
+    T_P_ATC PS CP assert in file mnphone_api.c line 7401
 
 * **7048**: one card's protocol stack brought up (`+SFUN=4` from `+CFUN: 0`) while the
   other card is attached.  Every time, and in Android's command order too.
 * **7038**: both stacks brought up from a fresh CP without the cards' work modes
   (`+SPTESTMODEM`).
+* **7401**: a stack (or SIM power) brought up for a slot with **no card in it**.  Measured
+  on 2026-10-04 with one card in slot 1: the power-up's `+SPACTCARD=1;+SFUN=2` to the
+  empty slot was followed ~5 s later by that assert, the CP's AT server went deaf
+  (`[modem0] port wwan0at0 timed out 2..10 consecutive times` → `marking modem as
+  invalid` → `mmcli -L` = *No modems were found* → the info screen's 「无模组」), and the
+  card that was in the phone stayed unreadable until `modem_control` reset the CP.  It
+  is not a one-off: ModemManager replays the same power-up from its cached events at
+  every start, so it re-asserted every time (t=40 s and again at t=439 s in one boot).
 * No assert: from a fresh CP (both at `+CFUN: 0`), as the RIL does after a restart --
   both SIMs on (`AT+SPACTCARD=<n>;+SFUN=2`), each card's work mode
   (`+SPTESTMODEM=<mode 1>,<mode 2>`, the modes `+SPTESTMODE?` holds), the data card
-  (`+SPSWDATA` on that card), then both stacks, the first card's first.  Both register;
-  the stacks then stay up, and moving the port to the other card never brings a stack
-  up from off.
+  (`+SPSWDATA` on that card), then both stacks, the first card's first -- **of the slots
+  holding a card only** (patch 07 reads `+SPACTCARD=n;+CCID?` per slot first).  Both
+  register; the stacks then stay up, and moving the port to the other card never brings
+  a stack up from off.
 
 `AT+SPSWDATA` makes the card it is sent for the one that carries data (`+SPSWDATA?`
 reads it; the CP starts on the first card).  Android sends it on the target card's
@@ -4156,7 +4166,7 @@ debugfs `stats` prints `tx_errors` in the `rx_errors` field.
 
 * `sipc_wwan card=` from `/etc/config/e5-sim` (`e5-sipc-wwan`; the 5.15 build has no
   `card` parameter and loads without it for the first card);
-* the unisoc plugin (patch 01, OpenWrt release E5REV 5): the 47.3 bring-up from
+* the unisoc plugin (patch 01, amended by 07, OpenWrt release E5REV 6): the 47.3 bring-up from
   `+CFUN: 0`, `+SPSWDATA` before every dial, context 1 on the modem's own net port (not
   `sipa_eth0` by name), and **SIM slots**: both cards listed (the other one's ICCID and
   IMSI read with its prefix), `SetPrimarySimSlot` runs `e5-sim` (detached: it restarts
