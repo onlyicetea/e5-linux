@@ -27,7 +27,8 @@
 # them the package does not pull libqmi/libmbim/libqrtr in); AT commands over
 # D-Bus on, as in the Debian build (mmcli --command, e5-at).
 #
-# The release is OpenWrt's plus 900 (1.24.0-r11 -> r911): the repository's
+# The release is OpenWrt's plus 900 (25.12.5's modemmanager is r8, so r908, and
+# r914 with E5REV 6 -- the build prints both numbers itself): the repository's
 # package never looks newer, so `apk upgrade` does not replace this one with a
 # modemmanager that has no unisoc plugin.  Plus E5REV, the revision of the E5
 # patches: raised whenever one of them changes, so that apk takes the rebuilt
