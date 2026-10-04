@@ -1,0 +1,181 @@
+Description: unisoc: don't bring a stack up on an empty SIM slot
+ The power-up from +CFUN: 0 attached both slots unconditionally, so whenever
+ one of them was empty it ran +SFUN=2 and +SFUN=4 for a slot holding no card,
+ and the CP asserted: 'modem cmd Modem Assert: T_P_ATC PS CP assert in file
+ mnphone_api.c line 7401' -- seen on the E5 on 2026-10-04 with a card in slot 1
+ and slot 2 empty, every single time ModemManager started (the power-up is
+ replayed from the cached events, so the assert is not a one-off).  An assert
+ silences the CP's AT server until the CP is reset, and modem_control left on
+ its own does that only after minutes, so every command afterwards times out;
+ ModemManager marks the modem invalid after ten of them and drops it, mmcli
+ then answers 'No modems were found', and the card that really is in the phone
+ is unreadable.  The slots holding a card are now read first, with
+ +SPACTCARD=n;+CCID? on each (an error or an empty +CCID: is no card, the same
+ test the SIM list uses), and only those get their SIM power, work mode and
+ stack.  With nothing in either slot the stacks stay off instead of being
+ raised on air; +CFUN? is still asked, so a modem with no card at all is
+ reported the way it was before.
+Author: e5-linux
+Forwarded: not-needed
+
+--- a/src/plugins/unisoc/mm-broadband-modem-unisoc.c
++++ b/src/plugins/unisoc/mm-broadband-modem-unisoc.c
+@@ -717,15 +717,24 @@
+ /*****************************************************************************/
+ /* Power */
+ 
+-/* Both cards on, from +CFUN: 0, in the vendor RIL's order: the SIMs, each
+- * card's work mode (+SPTESTMODEM, the modes +SPTESTMODE? holds), the port's
+- * card as the data card, then the stacks, the first card's first.  Without
+- * the work modes the second card's stack asserts the CP (mnphone_api.c:7038).
+- * Every command goes on whatever it answers: the second slot may be empty.
+- * The last one leaves the channel on the first card, for a port without the
+- * card prefix. */
++/* The cards' stacks on, from +CFUN: 0, in the vendor RIL's order: the SIMs,
++ * each card's work mode (+SPTESTMODEM, the modes +SPTESTMODE? holds), the
++ * port's card as the data card, then the stacks, the first card's first.
++ * Without the work modes the second card's stack asserts the CP
++ * (mnphone_api.c:7038).  Only slots that hold a card are sent at all: a stack
++ * brought up on an empty slot asserts the CP too (mnphone_api.c:7401, seen on
++ * the E5 on 2026-10-04), and the CP's AT server is then dead until the CP is
++ * reset -- every later command times out, ModemManager marks the modem
++ * invalid after ten of them, and the card that is in the phone is never read.
++ * Which slots hold a card is read first with +CCID? (an error: no SIM in that
++ * slot), the same query the SIM list uses.  The channel's card (AT+SPACTCARD
++ * sticks) is left on the last slot asked about, so every command below but
++ * the data-card one carries its own prefix. */
+ typedef struct {
+     MMBaseModemAtCommandAlloc cmds[9];
++    guint                     mode1, mode2;
++    guint                     probed;
++    gboolean                  sim[2];
+ } CardsOnContext;
+ 
+ static void
+@@ -762,13 +771,94 @@
+ }
+ 
+ static void
++cards_on_sequence (MMBaseModem  *self,
++                   GTask        *task)
++{
++    CardsOnContext *ctx = g_task_get_task_data (task);
++    guint           n = 0;
++
++    if (ctx->sim[0]) {
++        ctx->cmds[n].command = g_strdup ("+SPACTCARD=0;+SFUN=2");
++        ctx->cmds[n++].timeout = 60;
++    }
++    if (ctx->sim[1]) {
++        ctx->cmds[n].command = g_strdup ("+SPACTCARD=1;+SFUN=2");
++        ctx->cmds[n++].timeout = 60;
++    }
++    if (ctx->sim[1]) {
++        ctx->cmds[n].command = g_strdup_printf ("+SPACTCARD=1;+SPTESTMODEM=%u,%u",
++                                                ctx->mode1, ctx->mode2);
++        ctx->cmds[n++].timeout = 10;
++    }
++    if (ctx->sim[0]) {
++        ctx->cmds[n].command = g_strdup_printf ("+SPACTCARD=0;+SPTESTMODEM=%u,%u",
++                                                ctx->mode1, ctx->mode2);
++        ctx->cmds[n++].timeout = 10;
++    }
++    if (ctx->sim[0] || ctx->sim[1]) {
++        /* the card of the last command above is the one that carries data */
++        ctx->cmds[n].command = g_strdup ("+SPSWDATA");
++        ctx->cmds[n++].timeout = 10;
++    }
++    if (ctx->sim[0]) {
++        ctx->cmds[n].command = g_strdup ("+SPACTCARD=0;+SFUN=4");
++        ctx->cmds[n++].timeout = 60;
++    }
++    if (ctx->sim[1]) {
++        ctx->cmds[n].command = g_strdup ("+SPACTCARD=1;+SFUN=4");
++        ctx->cmds[n++].timeout = 60;
++    }
++    ctx->cmds[n].command = g_strdup ("+SPACTCARD=0;+CFUN?");
++    ctx->cmds[n++].timeout = 5;
++
++    mm_base_modem_at_sequence (self, (const MMBaseModemAtCommand *) ctx->cmds, NULL, NULL,
++                               (GAsyncReadyCallback) cards_on_sequence_ready, task);
++}
++
++static void
++cards_on_ccid_ready (MMBaseModem  *self,
++                     GAsyncResult *res,
++                     GTask        *task)
++{
++    CardsOnContext   *ctx = g_task_get_task_data (task);
++    g_autofree gchar *cmd = NULL;
++    const gchar      *response;
++
++    /* +CCID: "89861500202430712412"; an error or an empty string: no SIM in
++     * that slot.  Same test the SIM list uses, so both agree on what an empty
++     * slot is. */
++    response = mm_base_modem_at_command_finish (self, res, NULL);
++    ctx->sim[ctx->probed] = FALSE;
++    if (response) {
++        g_autofree gchar *iccid = NULL;
++
++        iccid = g_strdup (mm_strip_tag (response, "+CCID:"));
++        g_strdelimit (iccid, "\"", ' ');
++        g_strstrip (iccid);
++        ctx->sim[ctx->probed] = (*iccid != '\0');
++    }
++    ctx->probed++;
++    if (ctx->probed < G_N_ELEMENTS (ctx->sim)) {
++        cmd = g_strdup_printf ("+SPACTCARD=%u;+CCID?", ctx->probed);
++        mm_base_modem_at_command (self, cmd, 5, FALSE,
++                                  (GAsyncReadyCallback) cards_on_ccid_ready, task);
++        return;
++    }
++
++    if (!ctx->sim[0] && !ctx->sim[1])
++        mm_obj_dbg (self, "no SIM in either slot: leaving the stacks off");
++
++    cards_on_sequence (self, task);
++}
++
++static void
+ cards_on_testmode_ready (MMBaseModem  *self,
+                          GAsyncResult *res,
+                          GTask        *task)
+ {
+     CardsOnContext *ctx;
+     const gchar    *response;
+-    guint           mode1 = 134, mode2 = 134, a, b, n = 0;
++    guint           mode1 = 134, mode2 = 134, a, b;
+ 
+     /* +SPTESTMODE: <card 1>,<card 2>,<primary SIM>,... */
+     response = mm_base_modem_at_command_finish (self, res, NULL);
+@@ -779,26 +869,12 @@
+     }
+ 
+     ctx = g_slice_new0 (CardsOnContext);
+-    ctx->cmds[n].command = g_strdup ("+SPACTCARD=0;+SFUN=2");
+-    ctx->cmds[n++].timeout = 60;
+-    ctx->cmds[n].command = g_strdup ("+SPACTCARD=1;+SFUN=2");
+-    ctx->cmds[n++].timeout = 60;
+-    ctx->cmds[n].command = g_strdup_printf ("+SPACTCARD=1;+SPTESTMODEM=%u,%u", mode1, mode2);
+-    ctx->cmds[n++].timeout = 10;
+-    ctx->cmds[n].command = g_strdup_printf ("+SPACTCARD=0;+SPTESTMODEM=%u,%u", mode1, mode2);
+-    ctx->cmds[n++].timeout = 10;
+-    ctx->cmds[n].command = g_strdup ("+SPSWDATA");
+-    ctx->cmds[n++].timeout = 10;
+-    ctx->cmds[n].command = g_strdup ("+SPACTCARD=0;+SFUN=4");
+-    ctx->cmds[n++].timeout = 60;
+-    ctx->cmds[n].command = g_strdup ("+SPACTCARD=1;+SFUN=4");
+-    ctx->cmds[n++].timeout = 60;
+-    ctx->cmds[n].command = g_strdup ("+SPACTCARD=0;+CFUN?");
+-    ctx->cmds[n++].timeout = 5;
++    ctx->mode1 = mode1;
++    ctx->mode2 = mode2;
+     g_task_set_task_data (task, ctx, (GDestroyNotify) cards_on_context_free);
+ 
+-    mm_base_modem_at_sequence (self, (const MMBaseModemAtCommand *) ctx->cmds, NULL, NULL,
+-                               (GAsyncReadyCallback) cards_on_sequence_ready, task);
++    mm_base_modem_at_command (self, "+SPACTCARD=0;+CCID?", 5, FALSE,
++                              (GAsyncReadyCallback) cards_on_ccid_ready, task);
+ }
+ 
+ static void
