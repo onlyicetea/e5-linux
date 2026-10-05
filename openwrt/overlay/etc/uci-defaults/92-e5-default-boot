@@ -15,5 +15,10 @@ E5_DEFAULT_BOOT=
 # boot permanent.
 [ -f /etc/e5/sd-root ] && E5_DEFAULT_BOOT=linux
 [ "$E5_DEFAULT_BOOT" = linux ] || exit 0
-[ -f /etc/e5linux/default-boot ] && exit 0
+# Insisted, not only created: a card update copies the old value into the new
+# generation (openwrt/device-install-image.sh:345), and an "android" carried
+# that way is the reboot that lands in Android.  What already says linux needs
+# nothing.  e5-next-boot arms slot b as it records the choice, so the two
+# cannot disagree; e5-boot-ok keeps this right on every later boot.
+[ "$(cat /etc/e5linux/default-boot 2>/dev/null)" = linux ] && exit 0
 /opt/e5/e5-next-boot linux

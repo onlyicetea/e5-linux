@@ -25,5 +25,18 @@ start() {
 		/opt/e5/e5-next-boot linux 2>&1 | logger -t e5-boot-ok
 		return
 	fi
+	# A card in the slot is the system the user put there, so Linux is its
+	# default boot, and this keeps it that way rather than only asking once:
+	# boot/init hands the next boot to Android unless /etc/e5linux/default-boot
+	# says linux, 92-e5-default-boot writes it on the first boot of a root and
+	# is then gone (/etc/uci-defaults is emptied), and an update copies the old
+	# value into the new generation.  A stale android is the reboot that lands
+	# in Android.  e5-next-boot android still works -- it writes the slot-a
+	# block itself, so Android boots before this root runs again -- and a boot
+	# that never reaches START=99 still rolls back on its own.
+	if [ -f /etc/e5/sd-root ] && [ "$(cat /etc/e5linux/default-boot 2>/dev/null)" != linux ]; then
+		/opt/e5/e5-next-boot linux 2>&1 | logger -t e5-boot-ok
+		return
+	fi
 	/opt/e5/e5-next-boot --rearm 2>&1 | logger -t e5-boot-ok
 }
