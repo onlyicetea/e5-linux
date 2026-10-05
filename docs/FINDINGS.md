@@ -5855,3 +5855,58 @@ over the cellular link.  The device rebooted twice before its counters were read
 window is gone; the PC's route table has the E5's `usb0` at metric 8000 behind a metric-50
 default, which is indirect evidence only.  G1 (a boot with no card) and G3 (广电 46015/NR,
 the dual-slot matrix, `e5-sim`) are still unrun.
+
+## 66. 64's fix only ever wrote the file once: a card now insists on Linux every boot
+
+64 put Linux as the card's default boot into the image, and it holds as long as nothing later
+writes `android` over it.  Measured on the running card root (2026-10-05, before this change):
+
+    /etc/uci-defaults            -> 0 files   (OpenWrt deletes a script once it has run)
+    92-e5-default-boot:18        -> [ -f /etc/e5linux/default-boot ] && exit 0
+
+So the script that makes the choice is gone after the first boot of a root, and what it writes is
+create-only: a value that later says `android` -- carried into a new generation by a card update
+(`device-install-image.sh:345` copies the running system's file), or left by a hand or by the
+panel -- is never repaired.  One file decides the whole thing (`boot/init:670`: restore slot a
+unless it says linux), so that stale value is the reboot that lands in Android.
+
+The insistence belongs where a boot is known to have come up: `e5-boot-ok` runs at START=99 on
+every boot that reaches userspace, and it is also what re-arms slot b.  Gated on the card's own
+marker, because a card in the slot is the system the user put there:
+
+    openwrt/overlay/etc/init.d/e5-boot-ok          not linux and /etc/e5/sd-root -> next-boot linux
+    openwrt/overlay/etc/uci-defaults/92-e5-default-boot    repairs instead of only creating
+
+`e5-next-boot android` is not defeated by this: it writes the slot-a block to misc itself, so
+Android boots before this root is mounted again -- the way back to the stock system stays a
+command, not a race.  A boot that dies before START=99 still rolls back on its own (tries run
+out), which is what keeps a broken Linux from looping; `boot/init:673` is unchanged.
+
+Built natively (`E5_DOCKER=none`, 65's path) at `8ecd121` and checked inside the image before it
+was installed: both files byte-equal to `git show HEAD:` (the blobs, not the CRLF worktree) --
+`b2dfb743` and `4511563d`; `image-version 8ecd121`; and 63's/64's fixes still in place
+(`modemmanager 1.24.0-r915`, `disable_modem "0"` at :878, nothing under `/etc` setting it).
+Installed as card generation 2 (`/dev/mmcblk1p1`, generation 1 kept as the rollback), and the
+reboot from generation 1 came back in Linux on it:
+
+    e5-boot-ok: the card update's first boot is up: kept (8ecd121)
+    e5-boot-ok: slot b re-armed
+
+Then the failure itself, made on purpose and healed by a boot through the code START=99 runs:
+
+    echo android > /etc/e5linux/default-boot   ->  file: android
+    /etc/init.d/e5-boot-ok start               ->  file: linux, default boot: linux,
+                                                   next boot: linux, slot b info 2f (armed)
+
+Not done, on purpose: a real reboot *carrying* a stale `android` value.  That boot would go to
+Android and take the hotspot out of service until the Android side is driven by hand; the healing
+was proven by running what the boot runs, and the boot chain by the two reboots above.
+
+COM29 (the gadget's own `acm.GS0` -> guest `ttyGS0`) is the shell channel now, so none of this
+went through the NCM adapter except the 150 MB image, which the tty cannot carry (no `base64` on
+the device, and long lines lose bytes).  Two traps measured on the way, both in
+`repo-status/_e5com.py`:
+* waiting for a prompt after each typed line eats the very answer the caller then looks for, so a
+  command "times out with an empty buffer" while the device was replying all along;
+* `\r\n` per line becomes two newlines (ICRNL), which double-spaces a typed script -- the sha256
+  gate refused it three times before this was fixed, and only then did anything run.
